@@ -9,12 +9,16 @@ main.py  —  소비패턴 데이터 탐정 🕵️
   STEP 4. 알리바이 확인: 같은 질문을 Pandas로 다시 계산해 SQL 결과와 대조
                        + function/validation_suyeon.py 실행 → output/validation_result.csv
   STEP 5. 사건 보고서  : function/brief_seongho.py 실행 → output/briefing.md, output/brief.json
+  STEP 6. 메일 자동화  : n8n_auto.py(n8n 워크플로)가 brief.json을 메일로 보낼 수 있는지 점검
 
 실행: python main.py   (프로젝트 폴더 어디서 실행해도 동작)
 """
+import json
 import os
+import re
 import runpy
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +28,9 @@ from function.run_sql import DATABASE_PATH, DATA_DIR, SQL_DIR, load_csv_files
 
 PROJECT_DIR = Path(__file__).resolve().parent
 BRIEF_SCRIPT = PROJECT_DIR / "function" / "brief_seongho.py"
+BRIEF_JSON = PROJECT_DIR / "output" / "brief.json"
+# 확장자는 .py지만 내용은 n8n에서 내보낸 워크플로 JSON이다.
+N8N_WORKFLOW = PROJECT_DIR / "n8n_auto.py"
 
 # Q2 '큰 금액' 기준: 팀 합의값 (sql/q2, brief_seongho.py와 동일해야 함)
 HIGH_AMOUNT_THRESHOLD = 150_000
@@ -236,6 +243,76 @@ def write_briefing() -> None:
         os.chdir(current_dir)
 
 
+# ── STEP 6. 메일 자동화 ───────────────────────────────────
+def load_n8n_workflow() -> dict:
+    return json.loads(N8N_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def n8n_node(workflow: dict, kind: str) -> dict:
+    """노드 종류(httpRequest, gmail 등)로 워크플로 노드를 찾는다."""
+    return next(node for node in workflow["nodes"] if node["type"].endswith(f".{kind}"))
+
+
+def n8n_flow(workflow: dict) -> list[str]:
+    """트리거부터 connections를 따라가며 실행 순서대로 노드 이름을 나열한다."""
+    connections = workflow["connections"]
+    targets = {link["node"] for outs in connections.values() for branch in outs["main"] for link in branch}
+    current = next(name for name in connections if name not in targets)
+    flow = []
+    while current:
+        flow.append(current)
+        branches = connections.get(current, {}).get("main", [])
+        current = branches[0][0]["node"] if branches and branches[0] else None
+    return flow
+
+
+def check_n8n_handoff(workflow: dict, brief: dict) -> list[tuple[str, bool]]:
+    """n8n이 가져가는 파일·필드와 brief_seongho.py가 만든 brief.json이 맞물리는지 확인한다."""
+    url = n8n_node(workflow, "httpRequest")["parameters"]["url"]
+    mail = n8n_node(workflow, "gmail")["parameters"]
+    used_fields = sorted(set(re.findall(r"\$json\.(\w+)", json.dumps(mail))))
+    return [
+        ("n8n이 가져가는 파일 = output/brief.json", url.endswith("/output/brief.json")),
+        *[(f"brief.json '{field}' 필드 (메일 노드가 사용)", bool(brief.get(field))) for field in used_fields],
+    ]
+
+
+def n8n_notes(workflow: dict) -> list[str]:
+    """n8n에서 실행하기 전에 사람이 챙겨야 할 것."""
+    gmail = n8n_node(workflow, "gmail")
+    notes = []
+    if gmail["parameters"]["sendTo"].endswith("@example.com"):
+        notes.append("'브리핑 메일 발송' 노드의 받는 사람(To)이 예시 주소 — n8n에서 실제 주소로 바꿔야 함")
+    if "credentials" not in gmail:
+        notes.append("Gmail 계정(OAuth2)이 워크플로에 연결되어 있지 않음 — n8n에서 연결 필요")
+    try:
+        changed = subprocess.run(
+            ["git", "status", "--porcelain", "--", str(BRIEF_JSON)],
+            cwd=PROJECT_DIR, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        changed = ""
+    if changed:
+        notes.append("output/brief.json이 마지막 커밋과 다름 — GitHub main에 push해야 n8n이 새 내용을 가져감")
+    return notes
+
+
+def prepare_n8n_mail() -> bool:
+    section("STEP 6. 메일 자동화 — n8n 워크플로 점검 (n8n_auto.py)")
+    workflow = load_n8n_workflow()
+    brief = json.loads(BRIEF_JSON.read_text(encoding="utf-8"))
+    print(f"워크플로: {workflow['name']}")
+    print("흐름: " + " → ".join(n8n_flow(workflow)))
+
+    checks = check_n8n_handoff(workflow, brief)
+    for name, ok in checks:
+        print(f"{'✅' if ok else '❌'} {name}")
+    for note in n8n_notes(workflow):
+        print(f"⚠️ {note}")
+    print(f"\n메일 제목: {brief['subject']}")
+    return all(ok for _, ok in checks)
+
+
 def main() -> None:
     print("🕵️ 소비패턴 데이터 탐정 — 수사를 시작합니다")
     frames = load_frames()
@@ -245,6 +322,7 @@ def main() -> None:
     cross_check(tx, sql)
     run_validation()
     write_briefing()
+    prepare_n8n_mail()
     detective_findings(tx, sql)
 
 

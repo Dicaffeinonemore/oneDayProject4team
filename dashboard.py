@@ -8,17 +8,23 @@ main.py와 팀원 파일은 수정하지 않고 import만 한다.
 """
 import contextlib
 import io
+import json
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
 from main import (
+    BRIEF_JSON,
     HIGH_AMOUNT_THRESHOLD,
     SMALL_AMOUNT_THRESHOLD,
+    check_n8n_handoff,
     cross_check,
     inspect_data,
     load_frames,
+    load_n8n_workflow,
+    n8n_flow,
+    n8n_notes,
     run_sql_files,
     tag_transactions,
 )
@@ -116,7 +122,7 @@ tx_all, sql, all_ok, log_text = analyze()
 start = pd.to_datetime(tx_all["date"].min())
 end = pd.to_datetime(tx_all["date"].max())
 st.markdown(
-    f'<div class="eyebrow">사건 파일 · {start:%Y.%m}–{end:%Y.%m} · main.py step 1–5</div>'
+    f'<div class="eyebrow">사건 파일 · {start:%Y.%m}–{end:%Y.%m} · main.py step 1–6</div>'
     '<div class="title">🕵️ 소비패턴 데이터 탐정</div>'
     '<div class="lede">main.py가 터미널에 찍던 결과를 한 화면에 모은 대시보드입니다. '
     "위쪽 조건을 바꾸면 모든 숫자와 차트가 다시 계산됩니다.</div>"
@@ -229,8 +235,8 @@ def bar(data, x, y, title, height=260, **kw):
     )
 
 
-tab_q1, tab_q2, tab_q3, tab_quality, tab_check = st.tabs(
-    ["Q1 카테고리", "Q2 큰 금액", "Q3 기간 패턴", "데이터 품질", "검증 · SQL 결과"]
+tab_q1, tab_q2, tab_q3, tab_quality, tab_check, tab_mail = st.tabs(
+    ["Q1 카테고리", "Q2 큰 금액", "Q3 기간 패턴", "데이터 품질", "검증 · SQL 결과", "n8n 메일 브리핑"]
 )
 
 # ── Q1 ────────────────────────────────────────────────────
@@ -430,3 +436,30 @@ with tab_check:
 
     with st.expander("main.py 분석 로그 (콘솔 출력)"):
         st.code(log_text, language=None)
+
+# ── n8n 메일 브리핑 ───────────────────────────────────────
+with tab_mail:
+    st.caption(
+        "STEP 6 메일 자동화 — n8n_auto.py 워크플로가 GitHub의 output/brief.json을 가져가 Gmail로 보냅니다. "
+        "brief.json은 python main.py 실행 때 전체 데이터 기준으로 만들어지며, 조건 카드와 상관없습니다."
+    )
+    workflow = load_n8n_workflow()
+    st.markdown(f"**{workflow['name']}**  \n" + " → ".join(f"`{name}`" for name in n8n_flow(workflow)))
+
+    if not BRIEF_JSON.exists():
+        st.warning("output/brief.json이 없습니다. python main.py를 먼저 실행해 주세요.")
+    else:
+        brief = json.loads(BRIEF_JSON.read_text(encoding="utf-8"))
+        checks = check_n8n_handoff(workflow, brief)
+        if all(ok for _, ok in checks):
+            st.success("brief.json이 n8n 워크플로가 쓰는 파일·필드와 모두 맞습니다.")
+        for name, ok in checks:
+            st.markdown(f"{'✅' if ok else '❌'} {name}")
+        for note in n8n_notes(workflow):
+            st.warning(note)
+
+        st.markdown("**메일 미리보기**")
+        with st.container(border=True):
+            st.markdown(f"**제목** {brief['subject']}")
+            st.text(brief["body"])
+        st.dataframe(pd.DataFrame(brief["kpis"]), hide_index=True, width="stretch")
